@@ -161,5 +161,5 @@ cython_debug/
 .idea/
 
 # This files too big:
-#.logs/
-#.output/
+.logs/
+.output/
