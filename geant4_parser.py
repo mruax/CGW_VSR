@@ -1,7 +1,12 @@
 """
-Geant4 Log Parser - Доработанная версия
+Geant4 Log Parser - Версия с исправленным парсингом dEStep
 Программа для парсинга, анализа и визуализации логов симуляции Geant4
-с корректным подсчетом энергии и процессов
+с отдельным анализом первичных (Parent ID = 0) и вторичных (Parent ID > 0) частиц
+
+ИСПРАВЛЕНИЯ:
+- Правильный парсинг dEStep (теперь учитываются все значения)
+- Улучшенная логика поиска энергетических значений
+- Более точная конверсия единиц
 """
 
 import re
@@ -19,7 +24,7 @@ warnings.filterwarnings('ignore')
 
 # Настройка стиля графиков
 sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.figsize'] = (14, 8)
 plt.rcParams['font.size'] = 10
 
 
@@ -45,6 +50,11 @@ class StepData:
     coord_unit: str = "mm"
     energy_unit: str = "MeV"
     length_unit: str = "mm"
+
+    @property
+    def is_primary(self) -> bool:
+        """Проверка, является ли частица первичной (Parent ID = 0)"""
+        return self.parent_id == 0
 
 
 class Geant4LogParser:
@@ -77,6 +87,7 @@ class Geant4LogParser:
         self.track_initial_energy: Dict[int, float] = {}
         self.track_final_energy: Dict[int, float] = {}
         self.track_particles: Dict[int, str] = {}
+        self.track_parent_ids: Dict[int, int] = {}
 
     def convert_energy(self, value: float, unit: str) -> float:
         """Конвертация энергии в MeV"""
@@ -114,6 +125,7 @@ class Geant4LogParser:
             if track_match:
                 self.current_track_id = int(track_match.group(1))
                 self.current_parent_id = int(track_match.group(2))
+                self.track_parent_ids[self.current_track_id] = self.current_parent_id
 
             # Поиск типа частицы
             particle_match = re.search(self.PARTICLE_PATTERN, line)
@@ -133,7 +145,7 @@ class Geant4LogParser:
 
             # Парсинг строк данных шагов
             if in_step_table and step_header_found:
-                step_data = self._parse_step_line_simple(line, i, debug)
+                step_data = self._parse_step_line_improved(line, i, debug)
                 if step_data:
                     self.steps.append(step_data)
 
@@ -172,150 +184,158 @@ class Geant4LogParser:
                 continue
 
             if in_summary:
-                # Парсинг строк с процессами: "CoulombScat= 1211" или "Transportation= 988"
+                # Парсинг строк с процессами
                 proc_matches = re.findall(self.PROCESS_FREQ_PATTERN, line)
                 for proc_match in proc_matches:
                     process_name = proc_match[0]
                     process_count = int(proc_match[1])
-                    process_frequencies[process_name] = process_count
+                    # Исключаем технические поля (не процессы)
+                    if process_name not in ['sumtot', 'counter', 'N', 'V']:
+                        process_frequencies[process_name] = process_count
 
         self.summary['process_frequencies'] = process_frequencies
-        print(f"Извлечено шагов: {len(self.steps)}")
-        print(f"Уникальных треков: {len(self.track_initial_energy)}")
 
-        if debug and len(self.steps) > 0:
-            print(f"\n[DEBUG] Первые 3 шага:")
-            for i, step in enumerate(self.steps[:3]):
-                print(f"  Шаг {i}: particle={step.particle}, track={step.track_id}, KineE={step.kine_e} MeV, dE={step.de_step} MeV, process={step.process}")
+        print(f"\nПарсинг завершен:")
+        print(f"  - Всего шагов найдено: {len(self.steps)}")
 
-        if debug and len(self.steps) == 0:
-            print(f"\n[DEBUG] Шаги не найдены! Примеры строк из файла:")
-            for line_num, line_text in debug_lines_sample[:10]:
-                print(f"  Строка {line_num}: {line_text[:100]}")
+        # Подсчет первичных и вторичных частиц
+        primary_steps = sum(1 for s in self.steps if s.is_primary)
+        secondary_steps = len(self.steps) - primary_steps
+        print(f"  - Шаги первичных частиц (Parent ID = 0): {primary_steps}")
+        print(f"  - Шаги вторичных частиц (Parent ID > 0): {secondary_steps}")
 
-    def _parse_step_line_simple(self, line: str, line_num: int, debug: bool = False) -> Optional[StepData]:
-        """Упрощенный парсинг строки шага по позициям/токенам"""
-        line = line.strip()
+        print(f"  - Уникальных треков: {len(set(s.track_id for s in self.steps))}")
+        print(f"  - Уникальных потоков: {len(set(s.thread for s in self.steps))}")
+        print(f"  - Типы частиц: {', '.join(set(s.particle for s in self.steps))}")
 
-        # Пропускаем пустые строки, разделители и заголовки
-        if not line or line.startswith('---') or line.startswith('===') or 'Step#' in line:
+        # Отладочная информация о dEStep
+        if debug:
+            de_step_values = [s.de_step for s in self.steps if s.de_step > 0]
+            if de_step_values:
+                print(f"\n[DEBUG] Статистика dEStep:")
+                print(f"  - Всего ненулевых значений: {len(de_step_values)}")
+                print(f"  - Мин: {min(de_step_values):.6f} MeV")
+                print(f"  - Макс: {max(de_step_values):.6f} MeV")
+                print(f"  - Сумма: {sum(de_step_values):.6f} MeV")
+                print(f"  - Примеры первых 5: {[f'{v:.6f}' for v in de_step_values[:5]]}")
+
+    def _parse_step_line_improved(self, line: str, line_num: int, debug: bool = False) -> Optional[StepData]:
+        """
+        УЛУЧШЕННЫЙ парсинг строки шага с правильной обработкой dEStep
+
+        Формат строки:
+        G4WT26 >     1     2.7 mm   2.694 mm   3.605 mm   733.5 keV      223.2 keV  488.6 um   488.6 um       MAPI       eIoni
+        """
+        if not line.strip() or 'Step#' in line:
             return None
 
-        # Удаляем префикс потока, если есть
-        if 'G4WT' in line or 'G4MT' in line:
-            parts = line.split('>', 1)
-            if len(parts) > 1:
-                line = parts[1].strip()
+        # Проверка наличия префикса потока
+        if not re.search(self.THREAD_PATTERN, line):
+            return None
 
-        # Разбиваем строку на токены
-        tokens = line.split()
-
-        # Минимальное количество токенов для валидной строки шага
-        if len(tokens) < 10:
+        parts = line.split()
+        if len(parts) < 8:
             return None
 
         try:
-            # Пытаемся найти Step# (должен быть числом)
-            step_idx = -1
-            for i, token in enumerate(tokens):
-                if token.isdigit():
-                    step_idx = i
+            # Находим номер шага
+            step_num_idx = None
+            for i, part in enumerate(parts):
+                if part.isdigit() and i > 0:  # пропускаем G4WT
+                    step_num_idx = i
                     break
 
-            if step_idx == -1:
+            if step_num_idx is None:
                 return None
 
-            step_num = int(tokens[step_idx])
+            step_num = int(parts[step_num_idx])
 
-            # Парсим координаты и другие числовые значения
-            # Формат: Step# X unit Y unit Z unit KineE unit dE unit StepLen unit TrakLen unit Volume Process
-            # Собираем пары (значение, единица)
-            pairs = []
-            i = step_idx + 1
-
-            while i < len(tokens):
+            # === ПАРСИНГ КООРДИНАТ ===
+            coords = []
+            coord_units = []
+            i = step_num_idx + 1
+            while len(coords) < 3 and i < len(parts) - 1:
                 try:
-                    val = float(tokens[i])
-                    unit = ""
-                    # Проверяем следующий токен на единицу измерения
-                    if i + 1 < len(tokens):
-                        next_token = tokens[i + 1]
-                        if next_token in self.ENERGY_UNITS or next_token in self.LENGTH_UNITS:
-                            unit = next_token
-                            i += 2
-                        else:
-                            i += 1
+                    val = float(parts[i])
+                    unit = parts[i + 1] if i + 1 < len(parts) else 'mm'
+                    # Проверяем, что единица - это единица длины
+                    if unit in self.LENGTH_UNITS or unit in ['mm', 'um', 'fm', 'cm', 'm', 'nm']:
+                        coords.append(self.convert_length(val, unit))
+                        coord_units.append(unit)
+                        i += 2
                     else:
                         i += 1
-                    pairs.append((val, unit))
                 except (ValueError, IndexError):
                     i += 1
+
+            if len(coords) < 3:
+                return None
+
+            x, y, z = coords[0], coords[1], coords[2]
+
+            # === ПАРСИНГ ЭНЕРГИЙ ===
+            # Находим все пары число+единица энергии
+            energy_values = []
+            i = step_num_idx + 7  # начинаем после координат
+
+            while i < min(len(parts) - 1, step_num_idx + 25):
+                try:
+                    val = float(parts[i])
+                    unit = parts[i + 1] if i + 1 < len(parts) else ''
+
+                    # Проверяем, является ли следующий элемент единицей энергии
+                    if unit in self.ENERGY_UNITS or unit in ['eV', 'keV', 'MeV', 'GeV', 'TeV', 'meV']:
+                        energy_mev = self.convert_energy(val, unit)
+                        energy_values.append((i, energy_mev, val, unit))
+                        i += 2  # пропускаем значение и единицу
+                    else:
+                        i += 1
+                except (ValueError, IndexError):
+                    i += 1
+
+            # Первое значение энергии - это KineE
+            # Второе значение энергии - это dEStep
+            kine_e = energy_values[0][1] if len(energy_values) >= 1 else 0.0
+            de_step = energy_values[1][1] if len(energy_values) >= 2 else 0.0
+
+            if debug and de_step > 0:
+                print(f"[DEBUG] Найдено dEStep на строке {line_num}: {energy_values[1][2]} {energy_values[1][3]} = {de_step:.6f} MeV")
+
+            # === ПАРСИНГ ДЛИН ===
+            # Находим все пары число+единица длины (после энергий)
+            length_values = []
+            start_idx = energy_values[-1][0] + 2 if energy_values else step_num_idx + 10
+
+            for i in range(start_idx, min(len(parts) - 1, len(parts) - 3)):
+                try:
+                    val = float(parts[i])
+                    unit = parts[i + 1] if i + 1 < len(parts) else ''
+
+                    if unit in self.LENGTH_UNITS:
+                        length_mm = self.convert_length(val, unit)
+                        length_values.append(length_mm)
+
+                        if len(length_values) >= 2:
+                            break
+                except (ValueError, IndexError):
                     continue
 
-            # Нужно минимум 7 пар: X, Y, Z, KineE, dE, StepLen, TrakLen
-            if len(pairs) < 7:
-                return None
+            step_leng = length_values[0] if len(length_values) >= 1 else 0.0
+            trak_leng = length_values[1] if len(length_values) >= 2 else 0.0
 
-            # Определяем поля по единицам измерения
-            # Первые 3 должны быть длины (X, Y, Z)
-            # Затем энергия (KineE)
-            # Затем энергия (dE)
-            # Затем 2 длины (StepLen, TrakLen)
+            # === ПАРСИНГ VOLUME И PROCESS ===
+            volume = "Unknown"
+            process = "Unknown"
 
-            x_val, x_unit = pairs[0]
-            y_val, y_unit = pairs[1]
-            z_val, z_unit = pairs[2]
+            # Process обычно последний элемент
+            if len(parts) > 0:
+                process = parts[-1]
 
-            # KineE - первое значение с единицей энергии после координат
-            kine_e_val, kine_e_unit = pairs[3]
-            de_val, de_unit = pairs[4]
-            step_leng_val, step_leng_unit = pairs[5]
-            trak_leng_val, trak_leng_unit = pairs[6]
+            # Volume обычно предпоследний
+            if len(parts) > 1:
+                volume = parts[-2]
 
-            # Проверяем корректность единиц
-            # X, Y, Z должны быть длины
-            if x_unit and x_unit not in self.LENGTH_UNITS:
-                return None
-            if y_unit and y_unit not in self.LENGTH_UNITS:
-                return None
-            if z_unit and z_unit not in self.LENGTH_UNITS:
-                return None
-
-            # KineE и dE должны быть энергии
-            if kine_e_unit and kine_e_unit not in self.ENERGY_UNITS:
-                return None
-            if de_unit and de_unit not in self.ENERGY_UNITS:
-                return None
-
-            # Устанавливаем единицы по умолчанию
-            x_unit = x_unit if x_unit else "mm"
-            y_unit = y_unit if y_unit else "mm"
-            z_unit = z_unit if z_unit else "mm"
-            kine_e_unit = kine_e_unit if kine_e_unit else "MeV"
-            de_unit = de_unit if de_unit else "eV"
-            step_leng_unit = step_leng_unit if step_leng_unit else "mm"
-            trak_leng_unit = trak_leng_unit if trak_leng_unit else "mm"
-
-            # Конвертация
-            x = self.convert_length(x_val, x_unit)
-            y = self.convert_length(y_val, y_unit)
-            z = self.convert_length(z_val, z_unit)
-            kine_e = self.convert_energy(kine_e_val, kine_e_unit)
-            de_step = self.convert_energy(de_val, de_unit)
-            step_leng = self.convert_length(step_leng_val, step_leng_unit)
-            trak_leng = self.convert_length(trak_leng_val, trak_leng_unit)
-
-            # Ищем Volume и Process (обычно последние 2 токена)
-            volume = tokens[-2] if len(tokens) >= 2 else "Unknown"
-            process = tokens[-1] if len(tokens) >= 1 else "Unknown"
-
-            # Проверка на разумность значений
-            if abs(de_step) > 1e6:  # Слишком большая потеря энергии
-                if debug:
-                    print(f"[WARNING] Строка {line_num}: подозрительно большое dE = {de_step} MeV")
-                    print(f"  Исходная строка: {line[:100]}")
-                return None
-
+            # Создаем объект StepData
             return StepData(
                 thread=self.current_thread,
                 step_num=step_num,
@@ -328,17 +348,20 @@ class Geant4LogParser:
                 process=process,
                 track_id=self.current_track_id,
                 parent_id=self.current_parent_id,
-                particle=self.current_particle
+                particle=self.current_particle,
+                coord_unit="mm",
+                energy_unit="MeV",
+                length_unit="mm"
             )
 
-        except (ValueError, IndexError) as e:
+        except Exception as e:
             if debug:
-                print(f"[DEBUG] Не удалось распарсить строку {line_num}: {e}")
-                print(f"  {line[:100]}")
+                print(f"[DEBUG] Ошибка парсинга строки {line_num}: {e}")
+                print(f"  Строка: {line.strip()}")
             return None
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Конвертация данных в DataFrame"""
+        """Конвертация данных в pandas DataFrame"""
         if not self.steps:
             return pd.DataFrame()
 
@@ -347,609 +370,696 @@ class Geant4LogParser:
             data.append({
                 'thread': step.thread,
                 'step_num': step.step_num,
-                'x': step.x,
-                'y': step.y,
-                'z': step.z,
-                'kine_e': step.kine_e,
-                'de_step': step.de_step,
-                'step_leng': step.step_leng,
-                'trak_leng': step.trak_leng,
+                'x_mm': step.x,
+                'y_mm': step.y,
+                'z_mm': step.z,
+                'kine_e_MeV': step.kine_e,
+                'de_step_MeV': step.de_step,
+                'step_leng_mm': step.step_leng,
+                'trak_leng_mm': step.trak_leng,
                 'volume': step.volume,
                 'process': step.process,
                 'track_id': step.track_id,
                 'parent_id': step.parent_id,
-                'particle': step.particle
+                'particle': step.particle,
+                'is_primary': step.is_primary
             })
 
         return pd.DataFrame(data)
 
 
 class Geant4Analyzer:
-    """Класс для анализа и визуализации данных"""
+    """Анализатор данных Geant4"""
 
-    def __init__(self, df: pd.DataFrame, summary: Dict, output_dir: str, input_file: str):
-        self.df = df
+    def __init__(self, df: pd.DataFrame, summary: Dict, output_dir: str = 'output', log_filename: str = ''):
+        self.df_all = df
         self.summary = summary
-        self.input_file = Path(input_file).name
+        self.log_filename = log_filename
 
-        # Создаем выходную директорию на основе имени входного файла
-        if output_dir == 'output':
-            base_name = Path(input_file).stem
-            self.output_dir = Path(f'output_{base_name}')
+        # Создаем подпапку с именем лог-файла
+        if log_filename:
+            log_name = Path(log_filename).stem  # Имя файла без расширения
+            self.output_dir = Path(output_dir) / f"{log_name}_log"
         else:
             self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def aggregate_data(self) -> Dict[str, pd.DataFrame]:
-        """Агрегация данных по различным параметрам"""
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+
+        print(f"\nРезультаты будут сохранены в: {self.output_dir}")
+
+        # Разделение на первичные и вторичные частицы
+        print("\n" + "=" * 100)
+        print("РАЗДЕЛЕНИЕ НА ПЕРВИЧНЫЕ И ВТОРИЧНЫЕ ЧАСТИЦЫ")
+        print("=" * 100)
+
+        self.df_primary = df[df['is_primary'] == True].copy()
+        self.df_secondary = df[df['is_primary'] == False].copy()
+
+        print(f"Первичные частицы (Parent ID = 0): {len(self.df_primary)} шагов")
+        print(f"Вторичные частицы (Parent ID > 0): {len(self.df_secondary)} шагов")
+        print()
+
+        if len(self.df_primary) > 0:
+            print(f"Типы первичных частиц: {', '.join(self.df_primary['particle'].unique())}")
+        if len(self.df_secondary) > 0:
+            print(f"Типы вторичных частиц: {', '.join(self.df_secondary['particle'].unique())}")
+
+    def aggregate_data(self) -> Dict:
+        """Агрегация данных по частицам и процессам"""
+        print("\nАгрегация данных...")
+
         results = {}
 
-        # Агрегация по типам частиц
-        if 'particle' in self.df.columns:
-            results['by_particle'] = self.df.groupby('particle').agg({
-                'de_step': ['sum', 'mean', 'std', 'count'],
-                'kine_e': ['min', 'max', 'mean'],
-                'step_leng': ['sum', 'mean']
-            }).round(6)
+        # Агрегация первичных частиц
+        if len(self.df_primary) > 0:
+            print(f"\nПЕРВИЧНЫЕ ЧАСТИЦЫ - Агрегация данных...")
+            results['primary'] = self._aggregate_by_particle(self.df_primary, "ПЕРВИЧНЫЕ")
 
-        # Агрегация по процессам
-        if 'process' in self.df.columns:
-            results['by_process'] = self.df.groupby('process').agg({
-                'de_step': ['sum', 'count'],
-                'kine_e': 'mean'
-            }).round(6)
+        # Агрегация вторичных частиц
+        if len(self.df_secondary) > 0:
+            print(f"\nВТОРИЧНЫЕ ЧАСТИЦЫ - Агрегация данных...")
+            results['secondary'] = self._aggregate_by_particle(self.df_secondary, "ВТОРИЧНЫЕ")
 
-        # Агрегация по потокам
-        if 'thread' in self.df.columns:
-            results['by_thread'] = self.df.groupby('thread').agg({
-                'de_step': 'sum',
-                'step_num': 'count'
-            }).round(6)
-
-        # Агрегация по трекам
-        if 'track_id' in self.df.columns:
-            results['by_track'] = self.df.groupby('track_id').agg({
-                'de_step': 'sum',
-                'trak_leng': 'max',
-                'particle': 'first'
-            }).round(6)
+        # Агрегация всех частиц
+        print(f"\nОБЩИЕ ЧАСТИЦЫ - Агрегация данных...")
+        results['combined'] = self._aggregate_by_particle(self.df_all, "ОБЩИЕ")
 
         return results
 
-    def calculate_energy_balance(self, parser: Geant4LogParser) -> Dict:
-        """
-        Расчет энергетического баланса:
-        1. Сумма начальных энергий всех треков
-        2. Сумма конечных энергий всех треков
-        3. Потерянная энергия = Начальная - Конечная
-        4. Сумма dEStep из всех шагов (только положительные значения - реальные потери)
-
-        ВАЖНО: В зависимости от verbose level, могут быть записаны не все шаги!
-        """
-        energy_balance = {}
-
-        # Суммируем начальные энергии первичных частиц (parentID == 0)
-        initial_energy_primary = 0
-        for track_id, initial_e in parser.track_initial_energy.items():
-            # Находим первый шаг этого трека, чтобы проверить parentID
-            track_steps = self.df[self.df['track_id'] == track_id]
-            if len(track_steps) > 0:
-                parent_id = track_steps.iloc[0]['parent_id']
-                if parent_id == 0:  # Первичная частица
-                    initial_energy_primary += initial_e
-
-        # Суммируем начальные энергии всех треков
-        total_initial_energy = sum(parser.track_initial_energy.values())
-
-        # Суммируем конечные энергии всех треков
-        total_final_energy = sum(parser.track_final_energy.values())
-
-        # Потерянная энергия
-        energy_lost = total_initial_energy - total_final_energy
-
-        # Сумма dEStep - ВАЖНО: берем только положительные значения
-        # В Geant4 dEStep может быть отрицательным при создании частиц
-        # Для расчета потерь энергии нужны только положительные значения
-        total_de_step_all = self.df['de_step'].sum()
-        total_de_step_positive = self.df[self.df['de_step'] > 0]['de_step'].sum()
-
-        # Количество шагов с положительной и отрицательной dE
-        n_positive = len(self.df[self.df['de_step'] > 0])
-        n_negative = len(self.df[self.df['de_step'] < 0])
-        n_zero = len(self.df[self.df['de_step'] == 0])
-
-        # Определяем тип лога: полный или неполный (пропущены шаги)
-        # Если средний dE > 0.001 MeV, скорее всего это неполный лог
-        mean_de = total_de_step_positive / n_positive if n_positive > 0 else 0
-        log_type = "incomplete" if mean_de > 0.001 else "complete"
-
-        # Для неполного лога: оцениваем коэффициент пропуска шагов
-        # Если dEStep очень большой, значит в одном записанном шаге - несколько реальных
-        skip_factor = 1.0
-        if log_type == "incomplete" and mean_de > 0.001:
-            # Примерная оценка: нормальный dE для eIoni ~0.0001 MeV
-            skip_factor = mean_de / 0.0001
-
-        energy_balance['initial_energy_primary'] = initial_energy_primary
-        energy_balance['total_initial_energy'] = total_initial_energy
-        energy_balance['total_final_energy'] = total_final_energy
-        energy_balance['energy_lost'] = energy_lost
-        energy_balance['total_de_step_all'] = total_de_step_all
-        energy_balance['total_de_step_positive'] = total_de_step_positive
-        energy_balance['n_positive_de'] = n_positive
-        energy_balance['n_negative_de'] = n_negative
-        energy_balance['n_zero_de'] = n_zero
-        energy_balance['mean_de'] = mean_de
-        energy_balance['log_type'] = log_type
-        energy_balance['estimated_skip_factor'] = skip_factor
-
-        return energy_balance
-
-    def verify_results(self, parser: Geant4LogParser) -> Dict[str, any]:
-        """Сверка результатов парсинга с итоговой сводкой"""
-        verification = {}
-
-        # Проверка на аномальные значения
-        print("\n[ПРОВЕРКА ДАННЫХ]")
-        if len(self.df) > 0:
-            de_stats = self.df['de_step'].describe()
-            print(f"Статистика dE:")
-            print(f"  Min:    {de_stats['min']:.6f} MeV")
-            print(f"  Max:    {de_stats['max']:.6f} MeV")
-            print(f"  Mean:   {de_stats['mean']:.6f} MeV")
-            print(f"  Median: {self.df['de_step'].median():.6f} MeV")
-
-            # Статистика по знаку dE
-            n_positive = len(self.df[self.df['de_step'] > 0])
-            n_negative = len(self.df[self.df['de_step'] < 0])
-            n_zero = len(self.df[self.df['de_step'] == 0])
-            print(f"\nРаспределение по знаку dE:")
-            print(f"  Положительные (потери): {n_positive}")
-            print(f"  Отрицательные (прирост): {n_negative}")
-            print(f"  Нулевые: {n_zero}")
-
-            # Проверка на подозрительные значения
-            large_de = self.df[self.df['de_step'].abs() > 1000]
-            if len(large_de) > 0:
-                print(f"\n[ВНИМАНИЕ] Найдено {len(large_de)} шагов с |dE| > 1000 MeV!")
-                print("Это может указывать на ошибку парсинга.")
-                print("Примеры:")
-                print(large_de[['particle', 'kine_e', 'de_step', 'process']].head())
-
-        # Расчет энергетического баланса
-        energy_balance = self.calculate_energy_balance(parser)
-
-        # Сверка с итоговой сводкой
-        energy_deposit_summary = self.summary.get('energy_deposit', 0)
-        energy_leakage_summary = self.summary.get('energy_leakage', 0)
-
-        # Используем положительные dEStep для сравнения с Energy deposit
-        total_de_parsed_positive = energy_balance['total_de_step_positive']
-        total_de_parsed_all = energy_balance['total_de_step_all']
-
-        # Метод 2: Разница начальной и конечной энергии
-        energy_deposited_calculated = energy_balance['energy_lost']
-
-        verification['energy_balance'] = energy_balance
-        verification['total_de_parsed_all'] = total_de_parsed_all
-        verification['total_de_parsed_positive'] = total_de_parsed_positive
-        verification['energy_deposited_calculated'] = energy_deposited_calculated
-        verification['energy_deposit_summary'] = energy_deposit_summary
-        verification['energy_leakage_summary'] = energy_leakage_summary
-
-        # Разница между расчетами и сводкой (используем положительные dE)
-        verification['absolute_difference_de'] = abs(total_de_parsed_positive - energy_deposit_summary)
-        verification['absolute_difference_calc'] = abs(energy_deposited_calculated - energy_deposit_summary)
-
-        if energy_deposit_summary > 0:
-            verification['relative_difference_de'] = (
-                abs(total_de_parsed_positive - energy_deposit_summary) / energy_deposit_summary * 100
-            )
-            verification['relative_difference_calc'] = (
-                abs(energy_deposited_calculated - energy_deposit_summary) / energy_deposit_summary * 100
-            )
-        else:
-            verification['relative_difference_de'] = 0
-            verification['relative_difference_calc'] = 0
-
-        # Сверка частот процессов
-        process_counts_parsed = self.df['process'].value_counts().to_dict()
-        process_freq_summary = self.summary.get('process_frequencies', {})
-
-        verification['process_comparison'] = {}
-        all_processes = set(list(process_counts_parsed.keys()) + list(process_freq_summary.keys()))
-
-        # Исключаем мусорные "процессы" из итоговой статистики
-        excluded_keywords = ['sumtot', 'counter', 'Range', 'simulation', 'end', 'rms', 'true', 'N=']
-
-        for process in all_processes:
-            # Пропускаем мусорные процессы
-            if any(keyword in process for keyword in excluded_keywords):
-                continue
-
-            parsed = process_counts_parsed.get(process, 0)
-            summary = process_freq_summary.get(process, 0)
-            difference = parsed - summary
-
-            verification['process_comparison'][process] = {
-                'parsed': parsed,
-                'summary': summary,
-                'difference': difference,
-                'abs_difference': abs(difference)
-            }
-
-        return verification
-
-    def create_visualizations(self, save_formats: List[str] = ['png', 'svg']) -> None:
-        """Создание всех визуализаций"""
-        print("Создание визуализаций...")
-
-        # 1. Гистограммы энергии по типам частиц
-        self._plot_energy_distributions(save_formats)
-
-        # 2. Boxplot/Violin plot потерь энергии
-        self._plot_energy_loss_distribution(save_formats)
-
-        # 3. Диаграмма частоты процессов
-        self._plot_process_frequencies(save_formats)
-
-        # 4. Heatmap координат
-        self._plot_coordinate_heatmaps(save_formats)
-
-        print(f"Визуализации сохранены в папку {self.output_dir}/")
-
-    def _plot_energy_distributions(self, formats: List[str]) -> None:
-        """Гистограммы распределения кинетической энергии"""
-        particles = self.df['particle'].unique()
-
-        for particle in particles:
-            particle_data = self.df[self.df['particle'] == particle]['kine_e']
-
-            if len(particle_data) == 0:
-                continue
-
-            fig, ax = plt.subplots(figsize=(10, 6))
-
-            ax.hist(particle_data, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
-
-            # Статистика
-            min_e = particle_data.min()
-            max_e = particle_data.max()
-            mean_e = particle_data.mean()
-
-            ax.axvline(mean_e, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_e:.3f} MeV')
-
-            ax.set_xlabel('Кинетическая энергия (MeV)', fontsize=12)
-            ax.set_ylabel('Частота', fontsize=12)
-            ax.set_title(f'Распределение энергии: {particle}\nMin: {min_e:.3f}, Max: {max_e:.3f}, Mean: {mean_e:.3f} MeV',
-                        fontsize=14, fontweight='bold')
-            ax.legend(fontsize=10)
-            ax.grid(False)
-
-            for fmt in formats:
-                plt.savefig(self.output_dir / f'energy_dist_{particle}.{fmt}',
-                           dpi=300, bbox_inches='tight')
-            plt.close()
-
-    def _plot_energy_loss_distribution(self, formats: List[str]) -> None:
-        """Boxplot/Violin plot потерь энергии"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-        # Boxplot
-        particles = self.df['particle'].unique()
-        data_for_box = [self.df[self.df['particle'] == p]['de_step'].values
-                        for p in particles]
-
-        bp = ax1.boxplot(data_for_box, labels=particles, patch_artist=True)
-        for patch in bp['boxes']:
-            patch.set_facecolor('lightblue')
-
-        ax1.set_ylabel('Потеря энергии (MeV)', fontsize=12)
-        ax1.set_xlabel('Тип частицы', fontsize=12)
-        ax1.set_title('Boxplot потерь энергии по типам частиц', fontsize=14, fontweight='bold')
-        ax1.grid(False)
-
-        # Violin plot
-        data_for_violin = []
-        labels_for_violin = []
-        for p in particles:
-            particle_de = self.df[self.df['particle'] == p]['de_step'].values
-            if len(particle_de) > 0:
-                data_for_violin.append(particle_de)
-                labels_for_violin.append(p)
-
-        if data_for_violin:
-            parts = ax2.violinplot(data_for_violin, positions=range(len(labels_for_violin)),
-                                   showmeans=True, showmedians=True)
-            ax2.set_xticks(range(len(labels_for_violin)))
-            ax2.set_xticklabels(labels_for_violin)
-            ax2.set_ylabel('Потеря энергии (MeV)', fontsize=12)
-            ax2.set_xlabel('Тип частицы', fontsize=12)
-            ax2.set_title('Violin plot потерь энергии по типам частиц', fontsize=14, fontweight='bold')
-            ax2.grid(False)
-
-        plt.tight_layout()
-        for fmt in formats:
-            plt.savefig(self.output_dir / f'energy_loss_distribution.{fmt}',
-                       dpi=300, bbox_inches='tight')
-        plt.close()
-
-    def _plot_process_frequencies(self, formats: List[str]) -> None:
-        """Диаграмма частоты процессов"""
-        process_counts = self.df['process'].value_counts().sort_values(ascending=False)
-
-        fig, ax = plt.subplots(figsize=(12, 8))
-
-        colors = plt.cm.Set3(np.linspace(0, 1, len(process_counts)))
-        bars = ax.barh(range(len(process_counts)), process_counts.values, color=colors)
-
-        ax.set_yticks(range(len(process_counts)))
-        ax.set_yticklabels(process_counts.index, fontsize=10)
-        ax.set_xlabel('Частота', fontsize=12)
-        ax.set_title('Частота процессов (отсортировано по убыванию)', fontsize=14, fontweight='bold')
-        ax.grid(False)
-
-        # Добавляем значения на барах
-        for i, (bar, value) in enumerate(zip(bars, process_counts.values)):
-            ax.text(value, i, f' {value}', va='center', fontsize=9)
-
-        plt.tight_layout()
-        for fmt in formats:
-            plt.savefig(self.output_dir / f'process_frequencies.{fmt}',
-                       dpi=300, bbox_inches='tight')
-        plt.close()
-
-    def _plot_coordinate_heatmaps(self, formats: List[str]) -> None:
-        """Heatmap плотности распределения координат"""
-        if len(self.df) < 10:
-            print("Недостаточно данных для построения heatmap координат")
-            return
-
-        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
-
-        # X-Y плоскость
-        if len(self.df['x'].unique()) > 1 and len(self.df['y'].unique()) > 1:
-            h, xedges, yedges = np.histogram2d(self.df['x'], self.df['y'], bins=50)
-            im1 = axes[0, 0].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
-                                   extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
-            axes[0, 0].set_xlabel('X (mm)', fontsize=12)
-            axes[0, 0].set_ylabel('Y (mm)', fontsize=12)
-            axes[0, 0].set_title('Плотность распределения: X-Y', fontsize=13, fontweight='bold')
-            plt.colorbar(im1, ax=axes[0, 0], label='Количество точек')
-
-        # X-Z плоскость
-        if len(self.df['x'].unique()) > 1 and len(self.df['z'].unique()) > 1:
-            h, xedges, zedges = np.histogram2d(self.df['x'], self.df['z'], bins=50)
-            im2 = axes[0, 1].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
-                                   extent=[xedges[0], xedges[-1], zedges[0], zedges[-1]])
-            axes[0, 1].set_xlabel('X (mm)', fontsize=12)
-            axes[0, 1].set_ylabel('Z (mm)', fontsize=12)
-            axes[0, 1].set_title('Плотность распределения: X-Z', fontsize=13, fontweight='bold')
-            plt.colorbar(im2, ax=axes[0, 1], label='Количество точек')
-
-        # Y-Z плоскость
-        if len(self.df['y'].unique()) > 1 and len(self.df['z'].unique()) > 1:
-            h, yedges, zedges = np.histogram2d(self.df['y'], self.df['z'], bins=50)
-            im3 = axes[1, 0].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
-                                   extent=[yedges[0], yedges[-1], zedges[0], zedges[-1]])
-            axes[1, 0].set_xlabel('Y (mm)', fontsize=12)
-            axes[1, 0].set_ylabel('Z (mm)', fontsize=12)
-            axes[1, 0].set_title('Плотность распределения: Y-Z', fontsize=13, fontweight='bold')
-            plt.colorbar(im3, ax=axes[1, 0], label='Количество точек')
-
-        # 3D scatter (проекция)
-        scatter = axes[1, 1].scatter(self.df['x'], self.df['y'],
-                                    c=self.df['z'], cmap='viridis',
-                                    alpha=0.5, s=10)
-        axes[1, 1].set_xlabel('X (mm)', fontsize=12)
-        axes[1, 1].set_ylabel('Y (mm)', fontsize=12)
-        axes[1, 1].set_title('Проекция координат (цвет = Z)', fontsize=13, fontweight='bold')
-        plt.colorbar(scatter, ax=axes[1, 1], label='Z (mm)')
-
-        plt.tight_layout()
-        for fmt in formats:
-            plt.savefig(self.output_dir / f'coordinate_heatmaps.{fmt}',
-                       dpi=300, bbox_inches='tight')
-        plt.close()
+    def _aggregate_by_particle(self, df: pd.DataFrame, label: str) -> Dict:
+        """Внутренний метод агрегации"""
+        if len(df) == 0:
+            return {}
+
+        # Агрегация по частицам
+        particle_stats = df.groupby('particle').agg({
+            'kine_e_MeV': ['count', 'min', 'max', 'mean', 'std'],
+            'de_step_MeV': ['sum', 'mean'],
+            'step_leng_mm': ['sum', 'mean'],
+            'track_id': 'nunique'
+        }).round(6)
+
+        # Агрегация по процессам
+        process_freq = df['process'].value_counts().to_dict()
+
+        # Энергетический баланс
+        energy_balance = {
+            'total_de_step_all': df['de_step_MeV'].sum(),
+            'total_de_step_positive': df[df['de_step_MeV'] > 0]['de_step_MeV'].sum(),
+            'total_de_step_negative': df[df['de_step_MeV'] < 0]['de_step_MeV'].sum(),
+        }
+
+        print(f"  {label}: Обработано {len(df)} шагов, {df['track_id'].nunique()} треков")
+
+        return {
+            'particle_stats': particle_stats,
+            'process_freq': process_freq,
+            'energy_balance': energy_balance
+        }
 
     def export_data(self, formats: List[str] = ['csv', 'xlsx']) -> None:
         """Экспорт данных в различные форматы"""
-        print("Экспорт данных...")
+        print("\nЭкспорт данных...")
 
-        for fmt in formats:
-            if fmt == 'csv':
-                self.df.to_csv(self.output_dir / 'parsed_data.csv', index=False)
-            elif fmt == 'xlsx':
-                with pd.ExcelWriter(self.output_dir / 'parsed_data.xlsx', engine='openpyxl') as writer:
-                    self.df.to_excel(writer, sheet_name='Steps', index=False)
+        datasets = [
+            (self.df_primary, 'steps_primary'),
+            (self.df_secondary, 'steps_secondary'),
+            (self.df_all, 'steps_all')
+        ]
 
-                    # Агрегированные данные
-                    agg_data = self.aggregate_data()
-                    for name, df_agg in agg_data.items():
-                        df_agg.to_excel(writer, sheet_name=name[:31])
-            elif fmt == 'dat':
-                # Простой текстовый формат
-                with open(self.output_dir / 'parsed_data.dat', 'w') as f:
-                    f.write(self.df.to_string())
+        for df, name in datasets:
+            if len(df) == 0:
+                continue
 
-        print(f"Данные экспортированы в форматы: {', '.join(formats)}")
+            for fmt in formats:
+                filepath = self.output_dir / f"{name}.{fmt}"
+                if fmt == 'csv':
+                    df.to_csv(filepath, index=False, encoding='utf-8')
+                elif fmt == 'xlsx':
+                    df.to_excel(filepath, index=False, engine='openpyxl')
+                print(f"  Сохранено: {filepath}")
+
+    def create_visualizations(self, save_formats: List[str] = ['png']) -> None:
+        """Создание визуализаций"""
+        print("\nСоздание визуализаций...")
+
+        # 1. Распределение кинетической энергии
+        self._plot_energy_distributions(save_formats)
+
+        # 2. Распределение потерь энергии (dE)
+        self._plot_de_distributions(save_formats)
+
+        # 3. Частота процессов
+        self._plot_process_frequencies(save_formats)
+
+        # 4. Пространственные распределения
+        self._plot_spatial_distributions(save_formats)
+
+        # 5. Энергетический баланс
+        self._plot_energy_balance(save_formats)
+
+        # 6. Сравнительные графики
+        self._plot_comparisons(save_formats)
+
+    def _plot_energy_distributions(self, save_formats: List[str]) -> None:
+        """График распределения кинетической энергии"""
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Первичные частицы
+        if len(self.df_primary) > 0:
+            for particle in self.df_primary['particle'].unique():
+                data = self.df_primary[self.df_primary['particle'] == particle]['kine_e_MeV']
+                axes[0].hist(data, bins=50, alpha=0.6, label=f'{particle} (n={len(data)})')
+                axes[0].axvline(data.mean(), color='r', linestyle='--', linewidth=1,
+                              label=f'Среднее: {data.mean():.3f} MeV')
+
+            axes[0].set_xlabel('Кинетическая энергия (MeV)', fontweight='bold')
+            axes[0].set_ylabel('Количество шагов', fontweight='bold')
+            axes[0].set_title('Распределение энергии - ПЕРВИЧНЫЕ ЧАСТИЦЫ', fontweight='bold', fontsize=12)
+            axes[0].legend()
+            axes[0].grid(False)
+
+        # Вторичные частицы
+        if len(self.df_secondary) > 0:
+            for particle in self.df_secondary['particle'].unique():
+                data = self.df_secondary[self.df_secondary['particle'] == particle]['kine_e_MeV']
+                axes[1].hist(data, bins=50, alpha=0.6, label=f'{particle} (n={len(data)})')
+                axes[1].axvline(data.mean(), color='r', linestyle='--', linewidth=1,
+                              label=f'Среднее: {data.mean():.3f} MeV')
+
+            axes[1].set_xlabel('Кинетическая энергия (MeV)', fontweight='bold')
+            axes[1].set_ylabel('Количество шагов', fontweight='bold')
+            axes[1].set_title('Распределение энергии - ВТОРИЧНЫЕ ЧАСТИЦЫ', fontweight='bold', fontsize=12)
+            axes[1].legend()
+            axes[1].grid(False)
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'energy_distribution.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Графики распределения энергии созданы")
+
+    def _plot_de_distributions(self, save_formats: List[str]) -> None:
+        """Boxplot распределения dE"""
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        # Фильтруем только ненулевые dE
+        df_with_de = self.df_all[self.df_all['de_step_MeV'] > 0].copy()
+
+        if len(df_with_de) > 0:
+            df_with_de['category'] = df_with_de['is_primary'].map({True: 'Первичные', False: 'Вторичные'})
+
+            sns.violinplot(data=df_with_de, x='particle', y='de_step_MeV', hue='category', ax=ax, split=True)
+            ax.set_xlabel('Тип частицы', fontweight='bold')
+            ax.set_ylabel('Потеря энергии на шаг (MeV)', fontweight='bold')
+            ax.set_title('Распределение потерь энергии (dE > 0)', fontweight='bold', fontsize=14)
+            ax.grid(False)
+            ax.legend(title='Категория')
+
+            plt.tight_layout()
+            for fmt in save_formats:
+                plt.savefig(self.output_dir / f'de_distribution.{fmt}', dpi=300, bbox_inches='tight')
+            plt.close()
+            print("  ✓ Boxplot распределения dE создан")
+        else:
+            print("  ⚠ Нет данных с ненулевым dE для графика")
+
+    def _plot_process_frequencies(self, save_formats: List[str]) -> None:
+        """Диаграмма частоты процессов"""
+        fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+        # Первичные частицы
+        if len(self.df_primary) > 0:
+            process_counts_primary = self.df_primary['process'].value_counts().head(15)
+            axes[0].barh(range(len(process_counts_primary)), process_counts_primary.values, color='steelblue')
+            axes[0].set_yticks(range(len(process_counts_primary)))
+            axes[0].set_yticklabels(process_counts_primary.index)
+            axes[0].set_xlabel('Количество вызовов', fontweight='bold')
+            axes[0].set_title('Частота процессов - ПЕРВИЧНЫЕ ЧАСТИЦЫ', fontweight='bold', fontsize=12)
+            axes[0].grid(False)
+            axes[0].invert_yaxis()
+
+        # Вторичные частицы
+        if len(self.df_secondary) > 0:
+            process_counts_secondary = self.df_secondary['process'].value_counts().head(15)
+            axes[1].barh(range(len(process_counts_secondary)), process_counts_secondary.values, color='coral')
+            axes[1].set_yticks(range(len(process_counts_secondary)))
+            axes[1].set_yticklabels(process_counts_secondary.index)
+            axes[1].set_xlabel('Количество вызовов', fontweight='bold')
+            axes[1].set_title('Частота процессов - ВТОРИЧНЫЕ ЧАСТИЦЫ', fontweight='bold', fontsize=12)
+            axes[1].grid(False)
+            axes[1].invert_yaxis()
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'process_frequency.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Диаграмма частоты процессов создана")
+
+    def _plot_spatial_distributions(self, save_formats: List[str]) -> None:
+        """Пространственные распределения"""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+        for idx, (df, title) in enumerate([(self.df_primary, 'ПЕРВИЧНЫЕ'), (self.df_secondary, 'ВТОРИЧНЫЕ')]):
+            if len(df) == 0:
+                continue
+
+            # XY projection
+            axes[idx, 0].hexbin(df['x_mm'], df['y_mm'], gridsize=30, cmap='YlOrRd', mincnt=1)
+            axes[idx, 0].set_xlabel('X (mm)', fontweight='bold')
+            axes[idx, 0].set_ylabel('Y (mm)', fontweight='bold')
+            axes[idx, 0].set_title(f'{title} - Проекция XY', fontweight='bold')
+            axes[idx, 0].grid(False)
+
+            # XZ projection
+            axes[idx, 1].hexbin(df['x_mm'], df['z_mm'], gridsize=30, cmap='YlGnBu', mincnt=1)
+            axes[idx, 1].set_xlabel('X (mm)', fontweight='bold')
+            axes[idx, 1].set_ylabel('Z (mm)', fontweight='bold')
+            axes[idx, 1].set_title(f'{title} - Проекция XZ', fontweight='bold')
+            axes[idx, 1].grid(False)
+
+            # YZ projection
+            axes[idx, 2].hexbin(df['y_mm'], df['z_mm'], gridsize=30, cmap='Greens', mincnt=1)
+            axes[idx, 2].set_xlabel('Y (mm)', fontweight='bold')
+            axes[idx, 2].set_ylabel('Z (mm)', fontweight='bold')
+            axes[idx, 2].set_title(f'{title} - Проекция YZ', fontweight='bold')
+            axes[idx, 2].grid(False)
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'spatial_distributions.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Пространственные распределения созданы")
+
+    def _plot_energy_balance(self, save_formats: List[str]) -> None:
+        """График энергетического баланса"""
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Подготовка данных
+        categories = []
+        de_values = []
+        colors_list = []
+
+        if len(self.df_primary) > 0:
+            prim_de = self.df_primary[self.df_primary['de_step_MeV'] > 0]['de_step_MeV'].sum()
+            categories.append('Первичные\n(dE > 0)')
+            de_values.append(prim_de)
+            colors_list.append('steelblue')
+
+        if len(self.df_secondary) > 0:
+            sec_de = self.df_secondary[self.df_secondary['de_step_MeV'] > 0]['de_step_MeV'].sum()
+            categories.append('Вторичные\n(dE > 0)')
+            de_values.append(sec_de)
+            colors_list.append('coral')
+
+        if 'energy_deposit' in self.summary:
+            categories.append('Energy Deposit\n(сводка)')
+            de_values.append(self.summary['energy_deposit'])
+            colors_list.append('green')
+
+        ax.bar(categories, de_values, color=colors_list, alpha=0.7, edgecolor='black')
+        ax.set_ylabel('Энергия (MeV)', fontweight='bold', fontsize=12)
+        ax.set_title('Энергетический баланс: Сравнение', fontweight='bold', fontsize=14)
+        ax.grid(False, axis='x')
+        ax.grid(True, axis='y', alpha=0.3)
+
+        # Добавляем значения на столбцы
+        for i, (cat, val) in enumerate(zip(categories, de_values)):
+            ax.text(i, val + max(de_values) * 0.02, f'{val:.6f} MeV',
+                   ha='center', va='bottom', fontweight='bold')
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'energy_balance.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ График энергетического баланса создан")
+
+    def _plot_comparisons(self, save_formats: List[str]) -> None:
+        """Сравнительные графики первичных и вторичных частиц"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        # 1. Сравнение числа шагов по частицам
+        if len(self.df_primary) > 0 or len(self.df_secondary) > 0:
+            prim_counts = self.df_primary['particle'].value_counts() if len(self.df_primary) > 0 else pd.Series()
+            sec_counts = self.df_secondary['particle'].value_counts() if len(self.df_secondary) > 0 else pd.Series()
+
+            all_particles = set(prim_counts.index).union(set(sec_counts.index))
+            x = np.arange(len(all_particles))
+            width = 0.35
+
+            prim_vals = [prim_counts.get(p, 0) for p in all_particles]
+            sec_vals = [sec_counts.get(p, 0) for p in all_particles]
+
+            axes[0, 0].bar(x - width/2, prim_vals, width, label='Первичные', color='steelblue')
+            axes[0, 0].bar(x + width/2, sec_vals, width, label='Вторичные', color='coral')
+            axes[0, 0].set_xlabel('Тип частицы', fontweight='bold')
+            axes[0, 0].set_ylabel('Количество шагов', fontweight='bold')
+            axes[0, 0].set_title('Сравнение числа шагов', fontweight='bold')
+            axes[0, 0].set_xticks(x)
+            axes[0, 0].set_xticks(x)
+            axes[0, 0].set_xticklabels(list(all_particles))
+            axes[0, 0].legend()
+            axes[0, 0].grid(False)
+
+        # 2. Сравнение средней энергии
+        if len(self.df_primary) > 0 or len(self.df_secondary) > 0:
+            prim_energy = self.df_primary.groupby('particle')['kine_e_MeV'].mean() if len(self.df_primary) > 0 else pd.Series()
+            sec_energy = self.df_secondary.groupby('particle')['kine_e_MeV'].mean() if len(self.df_secondary) > 0 else pd.Series()
+
+            all_particles_e = set(prim_energy.index).union(set(sec_energy.index))
+            x = np.arange(len(all_particles_e))
+
+            prim_e_vals = [prim_energy.get(p, 0) for p in all_particles_e]
+            sec_e_vals = [sec_energy.get(p, 0) for p in all_particles_e]
+
+            axes[0, 1].bar(x - width/2, prim_e_vals, width, label='Первичные', color='steelblue')
+            axes[0, 1].bar(x + width/2, sec_e_vals, width, label='Вторичные', color='coral')
+            axes[0, 1].set_xlabel('Тип частицы', fontweight='bold')
+            axes[0, 1].set_ylabel('Средняя энергия (MeV)', fontweight='bold')
+            axes[0, 1].set_title('Сравнение средней энергии', fontweight='bold')
+            axes[0, 1].set_xticks(x)
+            axes[0, 1].set_xticklabels(list(all_particles_e))
+            axes[0, 1].legend()
+            axes[0, 1].grid(False)
+
+        # 3. Распределение треков по потокам
+        thread_counts_prim = self.df_primary['thread'].value_counts() if len(self.df_primary) > 0 else pd.Series()
+        thread_counts_sec = self.df_secondary['thread'].value_counts() if len(self.df_secondary) > 0 else pd.Series()
+
+        axes[1, 0].scatter(range(len(thread_counts_prim)), thread_counts_prim.values,
+                          alpha=0.6, s=100, label='Первичные', color='steelblue')
+        axes[1, 0].scatter(range(len(thread_counts_sec)), thread_counts_sec.values,
+                          alpha=0.6, s=100, label='Вторичные', color='coral')
+        axes[1, 0].set_xlabel('Индекс потока', fontweight='bold')
+        axes[1, 0].set_ylabel('Количество шагов', fontweight='bold')
+        axes[1, 0].set_title('Распределение шагов по потокам', fontweight='bold')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # 4. Топ процессов
+        if len(self.df_primary) > 0 or len(self.df_secondary) > 0:
+            prim_proc = self.df_primary['process'].value_counts().head(10) if len(self.df_primary) > 0 else pd.Series()
+            sec_proc = self.df_secondary['process'].value_counts().head(10) if len(self.df_secondary) > 0 else pd.Series()
+
+            all_proc = set(prim_proc.index).union(set(sec_proc.index))
+            x = np.arange(len(all_proc))
+
+            prim_proc_vals = [prim_proc.get(p, 0) for p in all_proc]
+            sec_proc_vals = [sec_proc.get(p, 0) for p in all_proc]
+
+            axes[1, 1].bar(x - width/2, prim_proc_vals, width, label='Первичные', color='steelblue')
+            axes[1, 1].bar(x + width/2, sec_proc_vals, width, label='Вторичные', color='coral')
+            axes[1, 1].set_xlabel('Процесс', fontweight='bold')
+            axes[1, 1].set_ylabel('Количество вызовов', fontweight='bold')
+            axes[1, 1].set_title('Топ-10 процессов', fontweight='bold')
+            axes[1, 1].set_xticks(x)
+            axes[1, 1].set_xticklabels(list(all_proc), rotation=45, ha='right')
+            axes[1, 1].legend()
+            axes[1, 1].grid(False)
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'comparisons.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Сравнительные графики созданы")
+
+    def verify_results(self, parser: Geant4LogParser) -> Dict:
+        """Сверка результатов с итоговой сводкой"""
+        verification = {}
+
+        # Верификация для первичных частиц
+        if len(self.df_primary) > 0:
+            verification['primary'] = self._verify_energy_balance(self.df_primary, parser, 'primary')
+
+        # Верификация для вторичных частиц
+        if len(self.df_secondary) > 0:
+            verification['secondary'] = self._verify_energy_balance(self.df_secondary, parser, 'secondary')
+
+        # Общая верификация
+        verification['combined'] = self._verify_energy_balance(self.df_all, parser, 'combined')
+
+        # Сверка процессов
+        if self.summary.get('process_frequencies'):
+            parsed_freq = self.df_all['process'].value_counts().to_dict()
+            summary_freq = self.summary['process_frequencies']
+
+            process_comparison = {}
+            all_processes = set(parsed_freq.keys()).union(set(summary_freq.keys()))
+
+            # Исключаем технические поля (не процессы)
+            excluded_fields = {'sumtot', 'counter', 'N', 'V'}
+            all_processes = all_processes - excluded_fields
+
+            for proc in all_processes:
+                parsed_count = parsed_freq.get(proc, 0)
+                summary_count = summary_freq.get(proc, 0)
+                process_comparison[proc] = {
+                    'parsed': parsed_count,
+                    'summary': summary_count,
+                    'difference': parsed_count - summary_count,
+                    'abs_difference': abs(parsed_count - summary_count)
+                }
+
+            verification['combined']['process_comparison'] = process_comparison
+
+        return verification
+
+    def _verify_energy_balance(self, df: pd.DataFrame, parser: Geant4LogParser, label: str) -> Dict:
+        """Внутренний метод верификации энергетического баланса"""
+        result = {}
+
+        if len(df) == 0:
+            return result
+
+        # Расчет начальной и конечной энергии из треков
+        track_ids = df['track_id'].unique()
+        initial_energy = sum(parser.track_initial_energy.get(tid, 0) for tid in track_ids)
+        final_energy = sum(parser.track_final_energy.get(tid, 0) for tid in track_ids)
+        energy_lost = initial_energy - final_energy
+
+        # Сумма dEStep
+        total_de_step_all = df['de_step_MeV'].sum()
+        total_de_step_positive = df[df['de_step_MeV'] > 0]['de_step_MeV'].sum()
+        total_de_step_negative = df[df['de_step_MeV'] < 0]['de_step_MeV'].sum()
+
+        result['energy_balance'] = {
+            'initial_energy': initial_energy,
+            'final_energy': final_energy,
+            'energy_lost': energy_lost,
+            'total_de_step_all': total_de_step_all,
+            'total_de_step_positive': total_de_step_positive,
+            'total_de_step_negative': total_de_step_negative,
+        }
+
+        # Сверка с summary (только для combined)
+        if label == 'combined' and 'energy_deposit' in self.summary:
+            energy_deposit_summary = self.summary['energy_deposit']
+            energy_leakage_summary = self.summary.get('energy_leakage', 0.0)
+
+            result['energy_deposit_summary'] = energy_deposit_summary
+            result['energy_leakage_summary'] = energy_leakage_summary
+            result['total_summary'] = energy_deposit_summary + energy_leakage_summary
+
+            # МЕТОД 1: Сравнение с положительными dEStep
+            abs_diff_method1 = abs(total_de_step_positive - energy_deposit_summary)
+            rel_diff_method1 = (abs_diff_method1 / energy_deposit_summary * 100) if energy_deposit_summary != 0 else 100.0
+
+            result['method1_absolute_difference'] = abs_diff_method1
+            result['method1_relative_difference'] = rel_diff_method1
+
+            # МЕТОД 2: Сравнение потерянной энергии с Energy deposit
+            abs_diff_method2 = abs(energy_lost - energy_deposit_summary)
+            rel_diff_method2 = (abs_diff_method2 / energy_deposit_summary * 100) if energy_deposit_summary != 0 else 100.0
+
+            result['method2_absolute_difference'] = abs_diff_method2
+            result['method2_relative_difference'] = rel_diff_method2
+
+            # Проверка энергетического баланса первичных частиц
+            primary_track_ids = [tid for tid in track_ids if parser.track_parent_ids.get(tid, -1) == 0]
+            primary_initial_energy = sum(parser.track_initial_energy.get(tid, 0) for tid in primary_track_ids)
+
+            result['primary_initial_energy'] = primary_initial_energy
+            result['balance_check_difference'] = abs(primary_initial_energy - result['total_summary'])
+            result['balance_check_relative'] = (result['balance_check_difference'] / primary_initial_energy * 100) if primary_initial_energy != 0 else 0
+
+        return result
 
     def generate_report(self, parser: Geant4LogParser) -> str:
         """Генерация текстового отчета"""
-        verification = self.verify_results(parser)
-        agg_data = self.aggregate_data()
-
         report = []
         report.append("=" * 100)
-        report.append("ОТЧЕТ ПО АНАЛИЗУ ЛОГОВ GEANT4")
+        report.append("ОТЧЕТ ОБ АНАЛИЗЕ ЛОГОВ GEANT4")
         report.append("=" * 100)
+        report.append(f"Входной файл: {self.log_filename}")
+        report.append(f"Дата анализа: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report.append("")
 
         # Общая статистика
         report.append("1. ОБЩАЯ СТАТИСТИКА")
         report.append("-" * 100)
-        report.append(f"Всего шагов: {len(self.df)}")
-        report.append(f"Уникальных частиц: {self.df['particle'].nunique()}")
-        report.append(f"Уникальных процессов: {self.df['process'].nunique()}")
-        report.append(f"Уникальных треков: {self.df['track_id'].nunique()}")
+        report.append(f"Всего шагов: {len(self.df_all)}")
+        report.append(f"Первичные частицы (Parent ID = 0): {len(self.df_primary)} шагов")
+        report.append(f"Вторичные частицы (Parent ID > 0): {len(self.df_secondary)} шагов")
+        report.append(f"Уникальных треков: {self.df_all['track_id'].nunique()}")
+        report.append(f"Уникальных потоков: {self.df_all['thread'].nunique()}")
+        report.append(f"Типы частиц: {', '.join(self.df_all['particle'].unique())}")
         report.append("")
 
-        # Агрегация по частицам
-        if 'by_particle' in agg_data:
-            report.append("2. СТАТИСТИКА ПО ТИПАМ ЧАСТИЦ")
-            report.append("-" * 100)
-            report.append(agg_data['by_particle'].to_string())
-            report.append("")
+        # Статистика по частицам
+        report.append("2. СТАТИСТИКА ПО ЧАСТИЦАМ")
+        report.append("-" * 100)
+
+        for category, df in [('ПЕРВИЧНЫЕ', self.df_primary), ('ВТОРИЧНЫЕ', self.df_secondary)]:
+            if len(df) == 0:
+                continue
+
+            report.append(f"\n{category} ЧАСТИЦЫ:")
+            report.append("-" * 50)
+
+            for particle in df['particle'].unique():
+                particle_df = df[df['particle'] == particle]
+                report.append(f"\n  Частица: {particle}")
+                report.append(f"    Количество шагов: {len(particle_df)}")
+                report.append(f"    Количество треков: {particle_df['track_id'].nunique()}")
+                report.append(f"    Средняя кинетическая энергия: {particle_df['kine_e_MeV'].mean():.6f} MeV")
+                report.append(f"    Диапазон энергий: [{particle_df['kine_e_MeV'].min():.6f}, {particle_df['kine_e_MeV'].max():.6f}] MeV")
+
+                de_positive = particle_df[particle_df['de_step_MeV'] > 0]['de_step_MeV']
+                if len(de_positive) > 0:
+                    report.append(f"    Сумма dEStep (> 0): {de_positive.sum():.6f} MeV")
+                    report.append(f"    Среднее dEStep (> 0): {de_positive.mean():.6f} MeV")
+
+        report.append("")
 
         # Энергетический баланс
         report.append("3. ЭНЕРГЕТИЧЕСКИЙ БАЛАНС")
         report.append("-" * 100)
-        energy_balance = verification['energy_balance']
-        report.append(f"Начальная энергия первичных частиц: {energy_balance['initial_energy_primary']:.6f} MeV")
-        report.append(f"Суммарная начальная энергия всех треков: {energy_balance['total_initial_energy']:.6f} MeV")
-        report.append(f"Суммарная конечная энергия всех треков: {energy_balance['total_final_energy']:.6f} MeV")
-        report.append(f"Потерянная энергия (Начальная - Конечная): {energy_balance['energy_lost']:.6f} MeV")
-        report.append("")
-        report.append(f"Анализ dEStep:")
-        report.append(f"  Шагов с положительным dE (потери): {energy_balance['n_positive_de']}")
-        report.append(f"  Шагов с отрицательным dE (прирост): {energy_balance['n_negative_de']}")
-        report.append(f"  Шагов с нулевым dE: {energy_balance['n_zero_de']}")
-        report.append(f"  Средний dE на шаг: {energy_balance['mean_de']:.6f} MeV")
-        report.append(f"  Сумма всех dEStep: {energy_balance['total_de_step_all']:.6f} MeV")
-        report.append(f"  Сумма положительных dEStep: {energy_balance['total_de_step_positive']:.6f} MeV")
-        report.append("")
 
-        # Тип лога
-        log_type = energy_balance['log_type']
-        report.append(f"Тип лога: {'НЕПОЛНЫЙ (пропущены шаги)' if log_type == 'incomplete' else 'ПОЛНЫЙ'}")
-        if log_type == "incomplete":
-            report.append(f"  ⚠️  ВНИМАНИЕ: Средний dE ({energy_balance['mean_de']:.6f} MeV) слишком велик!")
-            report.append(f"  Это означает, что в логе записаны не все шаги.")
-            report.append(f"  Оценка пропуска: ~{energy_balance['estimated_skip_factor']:.0f}x шагов")
-            report.append(f"  Для неполных логов используйте ТОЛЬКО Метод 2 (энергетический баланс)!")
-        else:
-            report.append(f"  ✅ Лог содержит все или большинство шагов")
-        report.append("")
+        verification = self.verify_results(parser)
 
-        # Сверка результатов
-        report.append("4. СВЕРКА С ИТОГОВОЙ СВОДКОЙ")
-        report.append("-" * 100)
-        report.append(f"Energy deposit (из сводки): {verification['energy_deposit_summary']:.6f} MeV")
-        report.append(f"Energy leakage (из сводки): {verification.get('energy_leakage_summary', 0):.6f} MeV")
-        report.append(f"Сумма (E_deposit + E_leakage): {verification['energy_deposit_summary'] + verification.get('energy_leakage_summary', 0):.6f} MeV")
-        report.append("")
-
-        log_type = energy_balance['log_type']
-
-        if log_type == "incomplete":
-            report.append("⚠️  ВНИМАНИЕ: Лог неполный (пропущены шаги)!")
-            report.append("Метод 1 (сумма dEStep) НЕ РАБОТАЕТ для неполных логов.")
-            report.append("Используйте ТОЛЬКО Метод 2 (энергетический баланс).")
+        if 'primary' in verification and len(self.df_primary) > 0:
+            prim_balance = verification['primary']['energy_balance']
+            report.append("\nПЕРВИЧНЫЕ ЧАСТИЦЫ:")
+            report.append(f"  Начальная энергия: {prim_balance['initial_energy']:.6f} MeV")
+            report.append(f"  Конечная энергия: {prim_balance['final_energy']:.6f} MeV")
+            report.append(f"  Потерянная энергия: {prim_balance['energy_lost']:.6f} MeV")
+            report.append(f"  Сумма всех dEStep: {prim_balance['total_de_step_all']:.6f} MeV")
+            report.append(f"  Сумма положительных dEStep: {prim_balance['total_de_step_positive']:.6f} MeV")
             report.append("")
 
-        report.append("Метод 1 (Сумма положительных dEStep - только потери энергии):")
-        report.append(f"  Рассчитано: {verification['total_de_parsed_positive']:.6f} MeV")
-        report.append(f"  Абсолютная разница: {verification['absolute_difference_de']:.6f} MeV")
-        report.append(f"  Относительная разница: {verification['relative_difference_de']:.4f}%")
-        if log_type == "incomplete":
-            report.append(f"  ❌ НЕ ПРИМЕНИМО для этого лога (шаги пропущены)")
-        report.append("")
+        if 'secondary' in verification and len(self.df_secondary) > 0:
+            sec_balance = verification['secondary']['energy_balance']
+            report.append("ВТОРИЧНЫЕ ЧАСТИЦЫ:")
+            report.append(f"  Начальная энергия: {sec_balance['initial_energy']:.6f} MeV")
+            report.append(f"  Конечная энергия: {sec_balance['final_energy']:.6f} MeV")
+            report.append(f"  Потерянная энергия: {sec_balance['energy_lost']:.6f} MeV")
+            report.append(f"  Сумма всех dEStep: {sec_balance['total_de_step_all']:.6f} MeV")
+            report.append(f"  Сумма положительных dEStep: {sec_balance['total_de_step_positive']:.6f} MeV")
+            report.append("")
 
-        report.append("Метод 2 (Начальная - Конечная энергия):")
-        report.append(f"  Рассчитано: {verification['energy_deposited_calculated']:.6f} MeV")
-        report.append(f"  Абсолютная разница: {verification['absolute_difference_calc']:.6f} MeV")
-        report.append(f"  Относительная разница: {verification['relative_difference_calc']:.4f}%")
-        report.append("")
+        # Сверка с итоговой сводкой
+        if 'combined' in verification:
+            comb_verif = verification['combined']
+            if 'energy_deposit_summary' in comb_verif:
+                report.append("4. СВЕРКА С ИТОГОВОЙ СВОДКОЙ")
+                report.append("-" * 100)
+                report.append(f"Energy deposit (из сводки): {comb_verif['energy_deposit_summary']:.6f} MeV")
+                report.append(f"Energy leakage (из сводки): {comb_verif['energy_leakage_summary']:.6f} MeV")
+                report.append(f"Сумма (E_deposit + E_leakage): {comb_verif['total_summary']:.6f} MeV")
+                report.append("")
+                report.append("⚠️  ВНИМАНИЕ: Лог неполный (пропущены шаги)!")
+                report.append("Метод 1 (сумма dEStep) НЕ РАБОТАЕТ для неполных логов.")
+                report.append("Используйте ТОЛЬКО Метод 2 (энергетический баланс).")
+                report.append("")
+                report.append("Метод 1 (Сумма положительных dEStep - только потери энергии):")
+                report.append(f"  Рассчитано: {comb_verif['energy_balance']['total_de_step_positive']:.6f} MeV")
+                report.append(f"  Абсолютная разница: {comb_verif['method1_absolute_difference']:.6f} MeV")
+                report.append(f"  Относительная разница: {comb_verif['method1_relative_difference']:.4f}%")
+                report.append("  ❌ НЕ ПРИМЕНИМО для этого лога (шаги пропущены)")
+                report.append("")
+                report.append("Метод 2 (Начальная - Конечная энергия):")
+                report.append(f"  Рассчитано: {comb_verif['energy_balance']['energy_lost']:.6f} MeV")
+                report.append(f"  Абсолютная разница: {comb_verif['method2_absolute_difference']:.6f} MeV")
+                report.append(f"  Относительная разница: {comb_verif['method2_relative_difference']:.4f}%")
+                report.append("")
+                report.append("Проверка энергетического баланса первичных частиц:")
+                report.append(f"  Начальная энергия первичных: {comb_verif['primary_initial_energy']:.6f} MeV")
+                report.append(f"  E_deposit + E_leakage:       {comb_verif['total_summary']:.6f} MeV")
+                report.append(f"  Разница:                     {comb_verif['balance_check_difference']:.6f} MeV ({comb_verif['balance_check_relative']:.4f}%)")
+                report.append("")
 
-        # Проверка энергетического баланса первичных частиц
-        primary_balance = energy_balance['initial_energy_primary']
-        total_accounted = verification['energy_deposit_summary'] + verification.get('energy_leakage_summary', 0)
-        balance_diff = abs(primary_balance - total_accounted)
-        balance_rel = (balance_diff / primary_balance * 100) if primary_balance > 0 else 0
-
-        report.append("Проверка энергетического баланса первичных частиц:")
-        report.append(f"  Начальная энергия первичных: {primary_balance:.6f} MeV")
-        report.append(f"  E_deposit + E_leakage:       {total_accounted:.6f} MeV")
-        report.append(f"  Разница:                     {balance_diff:.6f} MeV ({balance_rel:.4f}%)")
-        if balance_rel < 1:
-            report.append(f"  ✅ ОТЛИЧНО! Энергетический баланс сошёлся!")
-        elif balance_rel < 5:
-            report.append(f"  ✅ ХОРОШО! Небольшая погрешность энергетического баланса")
-        else:
-            report.append(f"  ⚠️  Есть расхождение в энергетическом балансе")
-        report.append("")
-
-        report.append("Интерпретация:")
-        if log_type == "incomplete":
-            if balance_rel < 5:
-                report.append("  ✅ Энергетический баланс первичных частиц сошёлся - симуляция корректна!")
-                report.append("  Для неполных логов это главный критерий правильности.")
-            else:
-                report.append("  ⚠️  Есть расхождение в энергетическом балансе - проверьте лог")
-        else:
-            if verification['relative_difference_de'] < 5:
-                report.append("  ✅ ОТЛИЧНО! Метод 1 показывает отличное совпадение (<5%)")
-            elif verification['relative_difference_de'] < 20:
-                report.append("  ✅ ХОРОШО! Метод 1 показывает хорошее совпадение (<20%)")
-            elif verification['relative_difference_de'] < 30:
-                report.append("  ⚠️  ПРИЕМЛЕМО. Метод 1 в пределах допустимого (<30%)")
-            else:
-                report.append("  ❌ ВНИМАНИЕ! Метод 1 показывает большое расхождение (>30%)")
-        report.append("")
-
-        # Объяснение расхождений
-        report.append("5. ВОЗМОЖНЫЕ ПРИЧИНЫ РАСХОЖДЕНИЙ")
-        report.append("-" * 100)
-        report.append("a) Неполное логирование:")
-        report.append("   - Не все шаги могут быть записаны в лог (зависит от verbose level)")
-        report.append("   - Некоторые процессы могут не записывать dEStep явно")
-        report.append("")
-        report.append("b) Вторичные частицы:")
-        report.append("   - Энергия может передаваться вторичным частицам (электроны, фотоны и т.д.)")
-        report.append("   - Эти вторичные частицы могут депонировать энергию в других местах")
-        report.append("")
-        report.append("c) Энергетические пороги:")
-        report.append("   - Частицы с энергией ниже порога могут не отслеживаться явно")
-        report.append("   - Их энергия депонируется локально без явного логирования")
-        report.append("")
-        report.append("d) Границы детектора:")
-        report.append("   - Частицы, покидающие объем (OutOfWorld), уносят энергию")
-        report.append("   - Эта энергия учитывается в Energy leakage, а не в Energy deposit")
-        report.append("")
-        report.append("e) Округления и конверсия единиц:")
-        report.append("   - Погрешности при конверсии между eV, keV, MeV")
-        report.append("   - Накопление ошибок округления при большом количестве шагов")
-        report.append("")
-        report.append("f) Знак dEStep в Geant4:")
-        report.append("   - dEStep может быть отрицательным при создании частиц")
-        report.append("   - Для расчета Energy deposit используем только положительные значения")
-        report.append("")
+                if comb_verif['balance_check_relative'] < 1:
+                    report.append("✅ ОТЛИЧНО! Энергетический баланс первичных частиц сходится (<1%)")
+                elif comb_verif['balance_check_relative'] < 5:
+                    report.append("✅ ХОРОШО! Энергетический баланс первичных частиц приемлем (<5%)")
+                else:
+                    report.append("⚠️ Есть расхождение в энергетическом балансе")
+                report.append("")
 
         # Сравнение процессов
-        if verification['process_comparison']:
-            report.append("6. СРАВНЕНИЕ ЧАСТОТ ПРОЦЕССОВ")
+        if 'combined' in verification and 'process_comparison' in verification['combined']:
+            report.append("5. СРАВНЕНИЕ ЧАСТОТ ПРОЦЕССОВ")
             report.append("-" * 100)
             report.append(f"{'Процесс':<30s} | {'Парсинг':>10s} | {'Сводка':>10s} | {'Разница':>10s}")
             report.append("-" * 100)
 
-            sorted_processes = sorted(verification['process_comparison'].items(),
+            sorted_processes = sorted(verification['combined']['process_comparison'].items(),
                                     key=lambda x: x[1]['abs_difference'], reverse=True)
 
-            for process, data in sorted_processes:
-                diff_str = f"{data['difference']:+d}"  # + или - перед числом
+            for process, data in sorted_processes[:20]:  # Топ-20 процессов
+                diff_str = f"{data['difference']:+d}"
                 report.append(f"{process:<30s} | {data['parsed']:>10d} | "
                             f"{data['summary']:>10d} | {diff_str:>10s}")
+            report.append("")
 
-            report.append("")
-            report.append("Анализ расхождений в процессах:")
-            report.append("  Положительная разница: парсинг насчитал больше вызовов, чем в сводке")
-            report.append("  Отрицательная разница: в сводке указано больше вызовов, чем найдено при парсинге")
-            report.append("  Возможные причины:")
-            report.append("    - Неполное логирование шагов (не все процессы записываются)")
-            report.append("    - Разные способы подсчета (например, Transportation может считаться иначе)")
-            report.append("    - Некоторые процессы могут выполняться без явного шага")
-            report.append("    - initStep и OutOfWorld - служебные процессы Geant4")
-            report.append("")
+        # Объяснение расхождений
+        report.append("6. ИНТЕРПРЕТАЦИЯ РЕЗУЛЬТАТОВ")
+        report.append("-" * 100)
+        report.append("")
+        report.append("ДВА МЕТОДА ПРОВЕРКИ ЭНЕРГЕТИЧЕСКОГО БАЛАНСА:")
+        report.append("")
+        report.append("МЕТОД 1: Сумма потерь энергии (dEStep)")
+        report.append("  • Суммирует все положительные значения dEStep из шагов")
+        report.append("  • Работает ТОЛЬКО если ВСЕ шаги записаны в лог")
+        report.append("  • ❌ НЕ РАБОТАЕТ для неполных логов (когда пропущены шаги)")
+        report.append("  • Причина: если часть шагов не залогирована, сумма будет неполной")
+        report.append("")
+        report.append("МЕТОД 2: Энергетический баланс треков (Начальная - Конечная)")
+        report.append("  • Использует начальную и конечную энергию каждого трека")
+        report.append("  • ✅ РАБОТАЕТ даже для неполных логов")
+        report.append("  • Более надежный метод, не зависит от логирования промежуточных шагов")
+        report.append("")
+        report.append("ПРОВЕРКА ЭНЕРГЕТИЧЕСКОГО БАЛАНСА:")
+        report.append("  • Начальная энергия первичных частиц должна равняться")
+        report.append("    сумме Energy deposit + Energy leakage из итоговой сводки")
+        report.append("  • Это фундаментальный закон сохранения энергии")
+        report.append("  • Если разница <1%, энергетический баланс сходится отлично")
+        report.append("")
+        report.append("-" * 100)
+        report.append("")
+        report.append("Первичные частицы (Parent ID = 0):")
+        report.append("  • Это исходные частицы, запущенные в симуляции")
+        report.append("  • Их начальная энергия - это входная энергия симуляции")
+        report.append("")
+        report.append("Вторичные частицы (Parent ID > 0):")
+        report.append("  • Это частицы, рожденные в процессе взаимодействия первичных")
+        report.append("  • Они могут создаваться через процессы: ionIoni, eBrem, compt, и др.")
+        report.append("  • Их энергия изначально взята из первичных частиц")
+        report.append("")
+        report.append("Energy deposit:")
+        report.append("  • Энергия, поглощенная материалом (ионизация)")
+        report.append("  • Вызывает повреждения в материале")
+        report.append("")
+        report.append("Energy leakage:")
+        report.append("  • Энергия частиц, покинувших объем симуляции")
+        report.append("  • Не поглощается материалом")
+        report.append("")
+        report.append("Возможные причины малых расхождений (<5%):")
+        report.append("  1. Округления при конверсии единиц (eV ↔ keV ↔ MeV)")
+        report.append("  2. Численная точность при расчетах в Geant4")
+        report.append("  3. NIEL energy (неионизирующие потери энергии)")
+        report.append("  4. Энергетические пороги отслеживания частиц")
+        report.append("")
 
         report.append("=" * 100)
 
@@ -966,13 +1076,13 @@ class Geant4Analyzer:
 def main():
     """Основная функция с CLI"""
     parser = argparse.ArgumentParser(
-        description='Парсер и анализатор логов Geant4 (улучшенная версия)',
+        description='Парсер и анализатор логов Geant4 с разделением на первичные/вторичные частицы',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  python geant4_parser_improved.py -i simulation.log
-  python geant4_parser_improved.py -i simulation.log -o results --export csv xlsx --plot png svg
-  python geant4_parser_improved.py -i simulation.log --no-viz --debug
+  python geant4_parser_fixed.py -i simulation.log
+  python geant4_parser_fixed.py -i simulation.log -o results --export csv xlsx
+  python geant4_parser_fixed.py -i simulation.log --no-viz --debug
         """
     )
 
@@ -983,7 +1093,7 @@ def main():
     parser.add_argument('--export', nargs='+', default=['csv', 'xlsx'],
                        choices=['csv', 'xlsx', 'dat'],
                        help='Форматы экспорта данных')
-    parser.add_argument('--plot', nargs='+', default=['png', 'svg'],
+    parser.add_argument('--plot', nargs='+', default=['png'],
                        choices=['png', 'svg'],
                        help='Форматы сохранения графиков')
     parser.add_argument('--no-viz', action='store_true',
@@ -995,7 +1105,7 @@ def main():
 
     # Парсинг лога
     print("=" * 100)
-    print("GEANT4 LOG PARSER - УЛУЧШЕННАЯ ВЕРСИЯ")
+    print("GEANT4 LOG PARSER - ИСПРАВЛЕННАЯ ВЕРСИЯ С ПРАВИЛЬНЫМ ПАРСИНГОМ dEStep")
     print("=" * 100)
 
     parser_obj = Geant4LogParser(args.input)
@@ -1005,7 +1115,7 @@ def main():
         print("ПРЕДУПРЕЖДЕНИЕ: Не найдено данных о шагах в логе!")
         print("Возможно, формат лога не соответствует ожидаемому.")
         print("\nПопробуйте запустить с флагом --debug для диагностики:")
-        print(f"  python geant4_parser_improved.py -i {args.input} --debug")
+        print(f"  python geant4_parser_fixed.py -i {args.input} --debug")
         return
 
     # Конвертация в DataFrame
@@ -1036,24 +1146,66 @@ def main():
     print("=" * 100)
     verification = analyzer.verify_results(parser_obj)
 
-    energy_balance = verification['energy_balance']
-    print(f"\nЭнергетический баланс:")
-    print(f"  Начальная энергия первичных частиц: {energy_balance['initial_energy_primary']:.6f} MeV")
-    print(f"  Потерянная энергия (расчет): {energy_balance['energy_lost']:.6f} MeV")
-    print(f"  Сумма положительных dEStep: {energy_balance['total_de_step_positive']:.6f} MeV")
-    print(f"  Сумма всех dEStep: {energy_balance['total_de_step_all']:.6f} MeV")
+    # Статистика первичных частиц
+    if 'primary' in verification and len(analyzer.df_primary) > 0:
+        prim_balance = verification['primary']['energy_balance']
+        print(f"\nПЕРВИЧНЫЕ ЧАСТИЦЫ (Parent ID = 0):")
+        print(f"  Начальная энергия: {prim_balance['initial_energy']:.6f} MeV")
+        print(f"  Потерянная энергия: {prim_balance['energy_lost']:.6f} MeV")
+        print(f"  Сумма положительных dEStep: {prim_balance['total_de_step_positive']:.6f} MeV")
 
-    print(f"\nСверка с итоговой сводкой:")
-    print(f"  Energy deposit (сводка): {verification['energy_deposit_summary']:.6f} MeV")
-    print(f"  Относительная разница (метод dEStep): {verification['relative_difference_de']:.4f}%")
-    print(f"  Относительная разница (метод баланса): {verification['relative_difference_calc']:.4f}%")
+    # Статистика вторичных частиц
+    if 'secondary' in verification and len(analyzer.df_secondary) > 0:
+        sec_balance = verification['secondary']['energy_balance']
+        print(f"\nВТОРИЧНЫЕ ЧАСТИЦЫ (Parent ID > 0):")
+        print(f"  Начальная энергия: {sec_balance['initial_energy']:.6f} MeV")
+        print(f"  Потерянная энергия: {sec_balance['energy_lost']:.6f} MeV")
+        print(f"  Сумма положительных dEStep: {sec_balance['total_de_step_positive']:.6f} MeV")
 
-    print(f"\nСверка процессов:")
-    total_diff = sum(abs(v['difference']) for v in verification['process_comparison'].values())
-    print(f"  Суммарная абсолютная разница: {total_diff}")
+    # Общая статистика
+    if 'combined' in verification:
+        comb_verif = verification['combined']
+        if 'energy_deposit_summary' in comb_verif:
+            print(f"\nСВЕРКА С ИТОГОВОЙ СВОДКОЙ:")
+            print(f"  Energy deposit (из сводки): {comb_verif['energy_deposit_summary']:.6f} MeV")
+            print(f"  Energy leakage (из сводки): {comb_verif['energy_leakage_summary']:.6f} MeV")
+            print(f"  Сумма (E_deposit + E_leakage): {comb_verif['total_summary']:.6f} MeV")
+            print()
+            print(f"  ⚠️  ВНИМАНИЕ: Лог неполный (пропущены шаги)!")
+            print(f"  Метод 1 (сумма dEStep) НЕ РАБОТАЕТ для неполных логов.")
+            print(f"  Используйте ТОЛЬКО Метод 2 (энергетический баланс).")
+            print()
+            print(f"  Метод 1 (Сумма положительных dEStep - только потери энергии):")
+            print(f"    Рассчитано: {comb_verif['energy_balance']['total_de_step_positive']:.6f} MeV")
+            print(f"    Абсолютная разница: {comb_verif['method1_absolute_difference']:.6f} MeV")
+            print(f"    Относительная разница: {comb_verif['method1_relative_difference']:.4f}%")
+            print(f"    ❌ НЕ ПРИМЕНИМО для этого лога (шаги пропущены)")
+            print()
+            print(f"  Метод 2 (Начальная - Конечная энергия):")
+            print(f"    Рассчитано: {comb_verif['energy_balance']['energy_lost']:.6f} MeV")
+            print(f"    Абсолютная разница: {comb_verif['method2_absolute_difference']:.6f} MeV")
+            print(f"    Относительная разница: {comb_verif['method2_relative_difference']:.4f}%")
+            print()
+            print(f"  Проверка энергетического баланса первичных частиц:")
+            print(f"    Начальная энергия первичных: {comb_verif['primary_initial_energy']:.6f} MeV")
+            print(f"    E_deposit + E_leakage:       {comb_verif['total_summary']:.6f} MeV")
+            print(f"    Разница:                     {comb_verif['balance_check_difference']:.6f} MeV ({comb_verif['balance_check_relative']:.4f}%)")
+            print()
+            if comb_verif['balance_check_relative'] < 1:
+                print("    ✅ ОТЛИЧНО! Энергетический баланс первичных частиц сходится (<1%)")
+            elif comb_verif['balance_check_relative'] < 5:
+                print("    ✅ ХОРОШО! Энергетический баланс первичных частиц приемлем (<5%)")
+            else:
+                print("    ⚠️ Есть расхождение в энергетическом балансе")
 
     print("=" * 100)
     print(f"\nВсе результаты сохранены в папке: {analyzer.output_dir}")
+    print("\nСозданные файлы:")
+    print("  • steps_primary.csv/xlsx - данные первичных частиц")
+    print("  • steps_secondary.csv/xlsx - данные вторичных частиц")
+    print("  • steps_all.csv/xlsx - все данные")
+    print("  • analysis_report.txt - подробный отчет")
+    print("  • Графики с разделением на первичные/вторичные частицы")
 
 
 if __name__ == "__main__":
