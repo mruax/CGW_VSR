@@ -33,7 +33,7 @@ pyinstaller --name=Geant4Parser ^
     --hidden-import=openpyxl ^
     --collect-all=matplotlib ^
     --collect-all=seaborn ^
-    geant4_parser.py
+    geant4_parser_GUI.py
 
 if errorlevel 1 (
     echo [ОШИБКА] Ошибка при создании спецификации!
