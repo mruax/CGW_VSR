@@ -2,24 +2,20 @@
 Geant4 Log Parser - Версия с исправленным парсингом dEStep
 Программа для парсинга, анализа и визуализации логов симуляции Geant4
 с отдельным анализом первичных (Parent ID = 0) и вторичных (Parent ID > 0) частиц
-
-ИСПРАВЛЕНИЯ:
-- Правильный парсинг dEStep (теперь учитываются все значения)
-- Улучшенная логика поиска энергетических значений
-- Более точная конверсия единиц
 """
 
-import re
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
-from collections import defaultdict
 import argparse
+import re
 import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
 warnings.filterwarnings('ignore')
 
 # Настройка стиля графиков
