@@ -162,4 +162,9 @@ cython_debug/
 
 # This files too big:
 .logs/
-.output/
+.output/**/*.xlsx
+.output/**/*.csv
+
+# Executable
+.build/
+.dist/output/*

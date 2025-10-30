@@ -499,27 +499,20 @@ class Geant4Analyzer:
                     df.to_excel(filepath, index=False, engine='openpyxl')
                 print(f"  Сохранено: {filepath}")
 
-    def create_visualizations(self, save_formats: List[str] = ['png']) -> None:
+    def create_visualizations(self, save_formats: List[str] = ['svg']) -> None:
         """Создание визуализаций"""
         print("\nСоздание визуализаций...")
 
-        # 1. Распределение кинетической энергии
         self._plot_energy_distributions(save_formats)
-
-        # 2. Распределение потерь энергии (dE)
         self._plot_de_distributions(save_formats)
-
-        # 3. Частота процессов
         self._plot_process_frequencies(save_formats)
-
-        # 4. Пространственные распределения
         self._plot_spatial_distributions(save_formats)
-
-        # 5. Энергетический баланс
         self._plot_energy_balance(save_formats)
-
-        # 6. Сравнительные графики
         self._plot_comparisons(save_formats)
+
+        # Новые функции
+        self._plot_coordinate_heatmaps(save_formats)
+        self._plot_particle_energy_distributions(save_formats)
 
     def _plot_energy_distributions(self, save_formats: List[str]) -> None:
         """График распределения кинетической энергии"""
@@ -782,6 +775,86 @@ class Geant4Analyzer:
             plt.savefig(self.output_dir / f'comparisons.{fmt}', dpi=300, bbox_inches='tight')
         plt.close()
         print("  ✓ Сравнительные графики созданы")
+
+    def _plot_coordinate_heatmaps(self, save_formats: List[str]) -> None:
+        """Heatmap плотности распределения координат (все частицы разом)"""
+        df = self.df_all
+        if len(df) < 10:
+            print("  ⚠ Недостаточно данных для построения heatmap координат")
+            return
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+
+        # X-Y плоскость
+        if len(df['x_mm'].unique()) > 1 and len(df['y_mm'].unique()) > 1:
+            h, xedges, yedges = np.histogram2d(df['x_mm'], df['y_mm'], bins=50)
+            im1 = axes[0, 0].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
+                                    extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
+            axes[0, 0].set_xlabel('X (mm)', fontsize=12)
+            axes[0, 0].set_ylabel('Y (mm)', fontsize=12)
+            axes[0, 0].set_title('Плотность распределения: X-Y', fontsize=13, fontweight='bold')
+            plt.colorbar(im1, ax=axes[0, 0], label='Количество точек')
+
+        # X-Z плоскость
+        if len(df['x_mm'].unique()) > 1 and len(df['z_mm'].unique()) > 1:
+            h, xedges, zedges = np.histogram2d(df['x_mm'], df['z_mm'], bins=50)
+            im2 = axes[0, 1].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
+                                    extent=[xedges[0], xedges[-1], zedges[0], zedges[-1]])
+            axes[0, 1].set_xlabel('X (mm)', fontsize=12)
+            axes[0, 1].set_ylabel('Z (mm)', fontsize=12)
+            axes[0, 1].set_title('Плотность распределения: X-Z', fontsize=13, fontweight='bold')
+            plt.colorbar(im2, ax=axes[0, 1], label='Количество точек')
+
+        # Y-Z плоскость
+        if len(df['y_mm'].unique()) > 1 and len(df['z_mm'].unique()) > 1:
+            h, yedges, zedges = np.histogram2d(df['y_mm'], df['z_mm'], bins=50)
+            im3 = axes[1, 0].imshow(h.T, origin='lower', cmap='hot', aspect='auto',
+                                    extent=[yedges[0], yedges[-1], zedges[0], zedges[-1]])
+            axes[1, 0].set_xlabel('Y (mm)', fontsize=12)
+            axes[1, 0].set_ylabel('Z (mm)', fontsize=12)
+            axes[1, 0].set_title('Плотность распределения: Y-Z', fontsize=13, fontweight='bold')
+            plt.colorbar(im3, ax=axes[1, 0], label='Количество точек')
+
+        # 3D проекция
+        scatter = axes[1, 1].scatter(df['x_mm'], df['y_mm'], c=df['z_mm'],
+                                     cmap='viridis', alpha=0.5, s=10)
+        axes[1, 1].set_xlabel('X (mm)', fontsize=12)
+        axes[1, 1].set_ylabel('Y (mm)', fontsize=12)
+        axes[1, 1].set_title('Проекция координат (цвет = Z)', fontsize=13, fontweight='bold')
+        plt.colorbar(scatter, ax=axes[1, 1], label='Z (mm)')
+
+        plt.tight_layout()
+        for fmt in save_formats:
+            plt.savefig(self.output_dir / f'coordinate_heatmaps.{fmt}', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Heatmap координат создан для всех частиц")
+
+    def _plot_particle_energy_distributions(self, save_formats: List[str]) -> None:
+        """Распределение кинетической энергии по каждой частице"""
+        out_dir = self.output_dir / "particle_distributions"
+        out_dir.mkdir(exist_ok=True, parents=True)
+
+        particles = self.df_all['particle'].unique()
+        for particle in particles:
+            df_p = self.df_all[self.df_all['particle'] == particle]
+            if len(df_p) < 5:
+                continue
+
+            plt.figure(figsize=(10, 6))
+            plt.hist(df_p['kine_e_MeV'], bins=50, alpha=0.7, color='steelblue')
+            plt.axvline(df_p['kine_e_MeV'].mean(), color='r', linestyle='--', linewidth=1,
+                        label=f'Среднее: {df_p["kine_e_MeV"].mean():.3f} MeV')
+            plt.xlabel('Кинетическая энергия (MeV)', fontweight='bold')
+            plt.ylabel('Количество шагов', fontweight='bold')
+            plt.title(f'Распределение энергии: {particle}', fontweight='bold', fontsize=12)
+            plt.legend()
+            plt.grid(False)
+            plt.tight_layout()
+
+            for fmt in save_formats:
+                plt.savefig(out_dir / f'energy_distribution_{particle}.{fmt}', dpi=300, bbox_inches='tight')
+            plt.close()
+        print(f"  ✓ Графики распределения энергии созданы для {len(particles)} частиц")
 
     def verify_results(self, parser: Geant4LogParser) -> Dict:
         """Сверка результатов с итоговой сводкой"""
@@ -1087,19 +1160,19 @@ def main():
     )
 
     parser.add_argument('-i', '--input', required=True,
-                       help='Входной файл лога Geant4')
+                        help='Входной файл лога Geant4')
     parser.add_argument('-o', '--output', default='output',
-                       help='Папка для выходных файлов (по умолчанию: output)')
-    parser.add_argument('--export', nargs='+', default=['csv', 'xlsx'],
-                       choices=['csv', 'xlsx', 'dat'],
-                       help='Форматы экспорта данных')
-    parser.add_argument('--plot', nargs='+', default=['png'],
-                       choices=['png', 'svg'],
-                       help='Форматы сохранения графиков')
+                        help='Папка для выходных файлов (по умолчанию: output)')
+    parser.add_argument('--export', nargs='+', default=['xlsx'],
+                        choices=['csv', 'xlsx', 'dat'],
+                        help='Форматы экспорта данных')
+    parser.add_argument('--plot', nargs='+', default=['svg'],
+                        choices=['png', 'svg'],
+                        help='Форматы сохранения графиков')
     parser.add_argument('--no-viz', action='store_true',
-                       help='Не создавать визуализации')
+                        help='Не создавать визуализации')
     parser.add_argument('--debug', action='store_true',
-                       help='Режим отладки с детальным выводом')
+                        help='Режим отладки с детальным выводом')
 
     args = parser.parse_args()
 
