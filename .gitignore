@@ -164,6 +164,8 @@ cython_debug/
 .logs/
 .output/**/*.xlsx
 .output/**/*.csv
+.output/**/*.png
+.output/**/*.svg
 
 # Executable
 .build/
