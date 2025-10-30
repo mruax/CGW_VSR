@@ -5,7 +5,7 @@ import sys
 import re
 
 if len(sys.argv) < 2:
-    print("Использование: python detailed_diagnostic.py ваш_лог.log")
+    print("Использование: python diagnostic_check_detailed.py ваш_лог.log")
     sys.exit(1)
 
 log_file = sys.argv[1]
