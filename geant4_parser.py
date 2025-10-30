@@ -477,10 +477,11 @@ class Geant4Analyzer:
             'energy_balance': energy_balance
         }
 
-    def export_data(self, formats: List[str] = ['csv', 'xlsx']) -> None:
-        """Экспорт данных в различные форматы"""
+    def export_data(self, formats: List[str] = ['xlsx']) -> None:
+        """Экспорт данных в различные форматы с разбиением >1 млн строк"""
         print("\nЭкспорт данных...")
 
+        MAX_ROWS = 1_000_000
         datasets = [
             (self.df_primary, 'steps_primary'),
             (self.df_secondary, 'steps_secondary'),
@@ -492,12 +493,36 @@ class Geant4Analyzer:
                 continue
 
             for fmt in formats:
-                filepath = self.output_dir / f"{name}.{fmt}"
-                if fmt == 'csv':
-                    df.to_csv(filepath, index=False, encoding='utf-8')
-                elif fmt == 'xlsx':
-                    df.to_excel(filepath, index=False, engine='openpyxl')
-                print(f"  Сохранено: {filepath}")
+                sub_dir = self.output_dir / "steps_parts" / fmt
+                sub_dir.mkdir(exist_ok=True, parents=True)
+
+                if len(df) > MAX_ROWS:
+                    num_parts = (len(df) // MAX_ROWS) + int(len(df) % MAX_ROWS > 0)
+                    print(f"  ⚠ {name}: {len(df):,} строк → разбивка на {num_parts} файлов по {MAX_ROWS:,} строк")
+
+                    for i in range(num_parts):
+                        start = i * MAX_ROWS
+                        end = start + MAX_ROWS
+                        df_part = df.iloc[start:end]
+                        filepath = sub_dir / f"{name}_part{i + 1}.{fmt}"
+
+                        if fmt == 'csv':
+                            df_part.to_csv(filepath, index=False, encoding='utf-8')
+                        elif fmt == 'xlsx':
+                            df_part.to_excel(filepath, index=False, engine='openpyxl')
+
+                        print(f"    • Сохранено: {filepath.name} ({len(df_part):,} строк)")
+
+                else:
+                    filepath = sub_dir / f"{name}.{fmt}"
+                    if fmt == 'csv':
+                        df.to_csv(filepath, index=False, encoding='utf-8')
+                    elif fmt == 'xlsx':
+                        df.to_excel(filepath, index=False, engine='openpyxl')
+
+                    print(f"  ✓ Сохранено: {filepath.name} ({len(df):,} строк)")
+
+        print(f"Данные сохранены в подпапках: {self.output_dir / 'steps_parts'}")
 
     def create_visualizations(self, save_formats: List[str] = ['svg']) -> None:
         """Создание визуализаций"""
