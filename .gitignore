@@ -170,3 +170,6 @@ cython_debug/
 # Executable
 .build/
 .dist/output/*
+
+# Word
+/docs/~$*.docx
